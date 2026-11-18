@@ -1,8 +1,8 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  # manual only: pushing a tag is done by hand next to a locally built release,
+  # so an automatic job would race with those assets
   workflow_dispatch:
 
 permissions:
