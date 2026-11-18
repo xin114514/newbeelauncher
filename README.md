@@ -1,5 +1,11 @@
 # NewBee Launcher
 
+[![release](https://img.shields.io/github/v/release/xin114514/newbeelauncher?color=5b8def)](https://github.com/xin114514/newbeelauncher/releases/latest)
+[![license](https://img.shields.io/github/license/xin114514/newbeelauncher)](LICENSE)
+[![platform](https://img.shields.io/badge/platform-windows%20x64-lightgrey)]()
+
+**[下载最新版](https://github.com/xin114514/newbeelauncher/releases/latest)** · 解压运行 `nbl.exe`，免安装。
+
 一个用 Rust 从零写的 Minecraft 启动器：**登录状态长期保留**、**每个实例版本隔离**、**直接拉取 Modrinth 的模组/资源包/光影列表**、**一键安装原版 + 任意模组加载器 + 内容**。
 
 带 GUI（egui，单文件原生窗口，无 Electron/WebView）和 CLI（`nbl-cli`）两套入口。
