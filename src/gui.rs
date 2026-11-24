@@ -47,6 +47,7 @@ enum Action {
     AddOffline,
     CreateInstance,
     SearchMods,
+    SearchPage(i64),
     InspectDependencies(String),
     InstallWithDependencies { target: String, dependencies: Vec<String> },
     RemoveContent(String),
@@ -78,6 +79,8 @@ pub struct NblApp {
     loader_versions: Vec<String>,
     results: Vec<SearchHit>,
     total_hits: u64,
+    search_offset: usize,
+    search_limit: usize,
     content: Vec<String>,
 
     show_login: bool,
@@ -163,6 +166,8 @@ impl NblApp {
             loader_versions: Vec::new(),
             results: Vec::new(),
             total_hits: 0,
+            search_offset: 0,
+            search_limit: 20,
             content: Vec::new(),
             show_login: false,
             show_new: false,
@@ -257,6 +262,29 @@ impl NblApp {
                     .map(|f| format!("[光影] {f}")),
             );
             let _ = datatx.send(DataMsg::Content(out));
+        });
+    }
+
+    fn start_search(&mut self, offset: usize) {
+        let Some(inst) = self.selected_instance().cloned() else { self.log("先在左侧选择一个实例"); return; };
+        let q = self.query.clone();
+        let ty = self.content_type.clone();
+        self.results_type = ty.clone();
+        self.search_offset = offset;
+        let mc = inst.mc_version.clone();
+        let loader = inst.loader.as_str().to_string();
+        let is_mod = ty == "mod";
+        let ctx = self.ctx();
+        let datatx = self.datatx.clone();
+        let limit = self.search_limit;
+        self.busy = true;
+        self.stage = format!("搜索 {ty}");
+        self.rt.spawn(async move {
+            let cats: Vec<&str> = if is_mod && loader != "vanilla" { vec![loader.as_str()] } else { vec![] };
+            match modrinth::search(&ctx, &q, &ty, Some(&mc), &cats, limit, offset).await {
+                Ok(r) => { let _ = datatx.send(DataMsg::Results(r.hits, r.total_hits)); }
+                Err(e) => { let _ = datatx.send(DataMsg::Error(format!("搜索失败: {e}"))); }
+            }
         });
     }
 
@@ -465,35 +493,12 @@ impl NblApp {
                 open_in_file_manager(&dir);
             }
             Action::SearchMods => {
-                let Some(inst) = self.selected_instance().cloned() else {
-                    self.log("先在左侧选择一个实例");
-                    return;
-                };
-                let q = self.query.clone();
-                let ty = self.content_type.clone();
-                self.results_type = ty.clone();
-                let mc = inst.mc_version.clone();
-                let loader = inst.loader.as_str().to_string();
-                let is_mod = ty == "mod";
-                let ctx = self.ctx();
-                let datatx = self.datatx.clone();
-                self.busy = true;
-                self.stage = format!("搜索 {ty}");
-                self.rt.spawn(async move {
-                    let cats: Vec<&str> = if is_mod && loader != "vanilla" {
-                        vec![loader.as_str()]
-                    } else {
-                        vec![]
-                    };
-                    match modrinth::search(&ctx, &q, &ty, Some(&mc), &cats, 30, 0).await {
-                        Ok(r) => {
-                            let _ = datatx.send(DataMsg::Results(r.hits, r.total_hits));
-                        }
-                        Err(e) => {
-                            let _ = datatx.send(DataMsg::Error(format!("搜索失败: {e}")));
-                        }
-                    }
-                });
+                self.start_search(0);
+            }
+            Action::SearchPage(delta) => {
+                let page = self.search_limit as i64;
+                let next = (self.search_offset as i64 + delta * page).max(0) as usize;
+                if next < self.total_hits as usize || delta < 0 { self.start_search(next); }
             }
             Action::InspectDependencies(pid) => {
                 let Some(inst) = self.selected_instance().cloned() else { return; };
@@ -931,11 +936,14 @@ impl eframe::App for NblApp {
                                     "光影",
                                 );
                             });
-                        ui.add(
+                        let query_response = ui.add(
                             egui::TextEdit::singleline(&mut self.query)
                                 .hint_text("搜索 Modrinth（留空看热门）")
                                 .desired_width(280.0),
                         );
+                        if query_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            pending = Some(Action::SearchMods);
+                        }
                         if ui.button("搜索").clicked() {
                             pending = Some(Action::SearchMods);
                         }
@@ -966,6 +974,7 @@ impl eframe::App for NblApp {
                         ui.weak(format!("共 {} 个结果", self.total_hits));
                     }
                     egui::ScrollArea::vertical()
+                        .id_salt("modrinth-search-results")
                         .max_height(360.0)
                         .show(ui, |ui| {
                             let hits = self.results.clone();
@@ -995,6 +1004,16 @@ impl eframe::App for NblApp {
                                 });
                             }
                         });
+                    ui.horizontal(|ui| {
+                        let page = self.search_offset / self.search_limit + 1;
+                        let pages = ((self.total_hits as usize + self.search_limit - 1) / self.search_limit).max(1);
+                        let prev = ui.add_enabled(self.search_offset > 0 && !self.busy, egui::Button::new("上一页"));
+                        if prev.clicked() { pending = Some(Action::SearchPage(-1)); }
+                        ui.label(format!("第 {page}/{pages} 页"));
+                        let has_next = self.search_offset + self.search_limit < self.total_hits as usize;
+                        let next = ui.add_enabled(has_next && !self.busy, egui::Button::new("下一页"));
+                        if next.clicked() { pending = Some(Action::SearchPage(1)); }
+                    });
                     ui.separator();
                     ui.strong(format!("已安装 ({} 项)", self.content.len()));
                     egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
