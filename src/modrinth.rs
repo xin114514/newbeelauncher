@@ -2,6 +2,7 @@
 //!
 //! Modrinth needs no API key, which makes it the best default content source.
 
+use crate::config;
 use crate::net;
 use crate::paths::Layout;
 use crate::Ctx;
@@ -64,6 +65,33 @@ pub struct Dependency {
     pub project_id: Option<String>,
     #[serde(default)]
     pub dependency_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyCandidate {
+    pub project_id: String,
+    pub title: String,
+    pub dependency_type: String,
+    pub status: String,
+    pub recommended_version: String,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyPlan {
+    pub target_project_id: String,
+    pub target_title: String,
+    pub candidates: Vec<DependencyCandidate>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,6 +205,12 @@ pub async fn versions_for(
     Ok(list)
 }
 
+/// Query a project's display metadata.
+pub async fn project_info(ctx: &Ctx, project_id: &str) -> Result<ProjectInfo> {
+    let url = format!("{API}/project/{project_id}");
+    net::get_json(&ctx.client, &url).await.context("获取项目详情失败")
+}
+
 /// Pick the best version: newest release, then newest beta/alpha.
 pub fn pick_best(list: &[ProjectVersion]) -> Option<&ProjectVersion> {
     list.iter()
@@ -271,6 +305,45 @@ pub async fn install_project(
         }
     }
     Ok(out)
+}
+
+fn normalized(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+fn local_project_match(files: &[String], info: &ProjectInfo) -> bool {
+    let keys = [normalized(&info.slug), normalized(&info.title), normalized(&info.id)];
+    files.iter().any(|f| {
+        let stem = Path::new(f).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let n = normalized(stem);
+        keys.iter().any(|k| !k.is_empty() && (n.starts_with(k) || n.contains(k)))
+    })
+}
+
+/// Resolve direct required/optional dependencies and compare them with local jar names.
+pub async fn dependency_plan(
+    ctx: &Ctx,
+    layout: &Layout,
+    instance_id: &str,
+    target_project_id: &str,
+    game_version: &str,
+    loader: Option<&str>,
+) -> Result<DependencyPlan> {
+    let target = project_info(ctx, target_project_id).await.unwrap_or(ProjectInfo { id: target_project_id.into(), slug: String::new(), title: target_project_id.into() });
+    let versions = versions_for(ctx, target_project_id, Some(game_version), loader).await?;
+    let Some(best) = pick_best(&versions) else { bail!("没有找到目标 Mod 的匹配版本") };
+    let files = config::list_dir(&layout.instance_mods_dir(instance_id));
+    let mut candidates = Vec::new();
+    for dep in &best.dependencies {
+        if dep.dependency_type != "required" && dep.dependency_type != "optional" { continue; }
+        let Some(pid) = dep.project_id.as_deref() else { continue; };
+        let info = project_info(ctx, pid).await.unwrap_or(ProjectInfo { id: pid.into(), slug: String::new(), title: pid.into() });
+        let dep_versions = versions_for(ctx, pid, Some(game_version), loader).await.unwrap_or_default();
+        let recommended = pick_best(&dep_versions).map(|v| if v.version_number.is_empty() { v.name.clone() } else { v.version_number.clone() }).unwrap_or_else(|| "适配版本".into());
+        let installed = local_project_match(&files, &info);
+        candidates.push(DependencyCandidate { project_id: pid.into(), title: if info.title.is_empty() { pid.into() } else { info.title }, dependency_type: dep.dependency_type.clone(), status: if installed { "installed".into() } else { "missing".into() }, recommended_version: recommended, selected: !installed && dep.dependency_type == "required" });
+    }
+    Ok(DependencyPlan { target_project_id: target_project_id.into(), target_title: target.title, candidates })
 }
 
 /// Convenience wrapper used by the "一键安装" button.

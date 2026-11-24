@@ -35,6 +35,7 @@ enum DataMsg {
     Reauthenticate(String),
     /// Installation completed; refresh the installed list and show a confirmation dialog.
     InstallFinished { message: String, items: Vec<String> },
+    DependencyPlan(crate::modrinth::DependencyPlan),
 }
 
 enum Action {
@@ -46,7 +47,8 @@ enum Action {
     AddOffline,
     CreateInstance,
     SearchMods,
-    InstallMod(String),
+    InspectDependencies(String),
+    InstallWithDependencies { target: String, dependencies: Vec<String> },
     RemoveContent(String),
     RefreshContent,
     SaveSettings,
@@ -99,6 +101,8 @@ pub struct NblApp {
     /// instance waiting for a delete confirmation: (id, name, folder)
     confirm_delete: Option<(String, String, PathBuf)>,
     install_notice: Option<String>,
+    dependency_plan: Option<crate::modrinth::DependencyPlan>,
+    dependency_warning: bool,
 }
 
 impl NblApp {
@@ -176,6 +180,8 @@ impl NblApp {
             instances_dir_input,
             confirm_delete: None,
             install_notice: None,
+            dependency_plan: None,
+            dependency_warning: false,
         };
         app.log(format!("数据目录: {}", layout.root().display()));
         if let Some(e) = load_error {
@@ -489,57 +495,41 @@ impl NblApp {
                     }
                 });
             }
-            Action::InstallMod(pid) => {
-                let Some(inst) = self.selected_instance().cloned() else {
-                    return;
-                };
-                let ty = if self.results_type.is_empty() {
-                    self.content_type.clone()
-                } else {
-                    self.results_type.clone()
-                };
+            Action::InspectDependencies(pid) => {
+                let Some(inst) = self.selected_instance().cloned() else { return; };
+                let ctx = self.ctx();
+                let layout = self.layout.clone();
+                let datatx = self.datatx.clone();
+                self.busy = true;
+                self.rt.spawn(async move {
+                    let loader = if inst.loader == LoaderKind::Vanilla { None } else { Some(inst.loader.as_str()) };
+                    match modrinth::dependency_plan(&ctx, &layout, &inst.id, &pid, &inst.mc_version, loader).await {
+                        Ok(plan) => { let _ = datatx.send(DataMsg::DependencyPlan(plan)); }
+                        Err(e) => { let _ = datatx.send(DataMsg::Error(format!("解析 Mod 前置失败: {e}"))); }
+                    }
+                });
+            }
+            Action::InstallWithDependencies { target, dependencies } => {
+                let Some(inst) = self.selected_instance().cloned() else { return; };
                 let layout = self.layout.clone();
                 let settings = self.cfg.settings.clone();
                 let ctx = self.ctx();
                 let datatx = self.datatx.clone();
                 self.busy = true;
-                self.stage = "下载内容".into();
-                self.log(format!("安装 {pid} → {}", inst.name));
                 self.rt.spawn(async move {
-                    let loader = if ty == "mod" {
-                        Some(inst.loader.as_str())
-                    } else {
-                        None
-                    };
-                    let res = modrinth::install_by_project(
-                        &ctx,
-                        &layout,
-                        &inst.id,
-                        &ty,
-                        &pid,
-                        &inst.mc_version,
-                        loader,
-                        settings.concurrency,
-                    )
-                    .await;
-                    match res {
+                    let loader = if inst.loader == LoaderKind::Vanilla { None } else { Some(inst.loader.as_str()) };
+                    let mut count = 0usize;
+                    for dep in dependencies {
+                        if let Ok(files) = modrinth::install_by_project(&ctx, &layout, &inst.id, "mod", &dep, &inst.mc_version, loader, settings.concurrency).await { count += files.len(); }
+                    }
+                    match modrinth::install_by_project(&ctx, &layout, &inst.id, "mod", &target, &inst.mc_version, loader, settings.concurrency).await {
                         Ok(files) => {
-                            let mut out = config::list_dir(&layout.instance_mods_dir(&inst.id));
-                            out.extend(
-                                config::list_dir(&layout.instance_resourcepacks_dir(&inst.id))
-                                    .into_iter()
-                                    .map(|f| format!("[资源包] {f}")),
-                            );
-                            out.extend(
-                                config::list_dir(&layout.instance_shaderpacks_dir(&inst.id))
-                                    .into_iter()
-                                    .map(|f| format!("[光影] {f}")),
-                            );
-                            let _ = datatx.send(DataMsg::InstallFinished {
-                                message: format!("安装完成：已下载 {} 个文件", files.len()),
-                                items: out,
-                            });
-                            ctx.tx.done(format!("已下载 {} 个文件", files.len()));
+                            let mut items = config::list_dir(&layout.instance_mods_dir(&inst.id));
+                            items.extend(config::list_dir(&layout.instance_resourcepacks_dir(&inst.id)).into_iter().map(|f| format!("[资源包] {f}")));
+                            items.extend(config::list_dir(&layout.instance_shaderpacks_dir(&inst.id)).into_iter().map(|f| format!("[光影] {f}")));
+                            let total = count + files.len();
+                            let _ = datatx.send(DataMsg::InstallFinished { message: format!("安装完成，共下载 {total} 个文件"), items });
+                            ctx.tx.done(format!("安装完成，共下载 {total} 个文件"));
                         }
                         Err(e) => ctx.tx.failed(format!("安装失败: {e}")),
                     }
@@ -740,6 +730,11 @@ impl NblApp {
                     self.log(message);
                     self.busy = false;
                     self.progress = None;
+                }
+                DataMsg::DependencyPlan(plan) => {
+                    self.busy = false;
+                    self.dependency_plan = Some(plan);
+                    self.dependency_warning = false;
                 }
             }
         }
@@ -988,7 +983,7 @@ impl eframe::App for NblApp {
                                             egui::Button::new("安装").min_size(egui::vec2(72.0, 28.0)),
                                         );
                                         if install.clicked() {
-                                            pending = Some(Action::InstallMod(
+                                            pending = Some(Action::InspectDependencies(
                                                 hit.project_id.clone(),
                                             ));
                                         }
@@ -1116,6 +1111,38 @@ impl eframe::App for NblApp {
         }
         if self.confirm_delete.is_some() {
             self.delete_confirm_window(ctx, &mut pending);
+        }
+        if let Some(plan) = self.dependency_plan.as_mut() {
+            let mut open = true;
+            let mut close = false;
+            let mut confirm = false;
+            egui::Window::new("安装前置模组").collapsible(false).open(&mut open).show(ctx, |ui| {
+                ui.label(format!("{} 需要以下前置：", plan.target_title));
+                for dep in &mut plan.candidates {
+                    let icon = if dep.dependency_type == "required" { "🔴" } else { "🔵" };
+                    let state = if dep.status == "installed" { "✅ 已安装" } else { "⚠️ 未安装" };
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut dep.selected, format!("{icon} {} · {} · {}", dep.title, state, dep.recommended_version));
+                    });
+                }
+                if self.dependency_warning { ui.colored_label(egui::Color32::YELLOW, "已取消必需前置，目标 Mod 可能无法启动。再次点击确认继续。"); }
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() { close = true; }
+                    if ui.button("确认安装").clicked() { confirm = true; }
+                });
+            });
+            if confirm {
+                let missing_required = plan.candidates.iter().any(|d| d.dependency_type == "required" && d.status != "installed" && !d.selected);
+                if missing_required && !self.dependency_warning { self.dependency_warning = true; }
+                else {
+                    let target = plan.target_project_id.clone();
+                    let deps = plan.candidates.iter().filter(|d| d.selected && d.status != "installed").map(|d| d.project_id.clone()).collect();
+                    pending = Some(Action::InstallWithDependencies { target, dependencies: deps });
+                    open = false;
+                }
+            }
+            if close { open = false; }
+            if !open { self.dependency_plan = None; self.dependency_warning = false; }
         }
         if let Some(message) = self.install_notice.clone() {
             let mut open = true;
