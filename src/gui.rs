@@ -33,6 +33,8 @@ enum DataMsg {
     Error(String),
     /// The stored Microsoft refresh token is permanently invalid and needs a new device-code login.
     Reauthenticate(String),
+    /// Installation completed; refresh the installed list and show a confirmation dialog.
+    InstallFinished { message: String, items: Vec<String> },
 }
 
 enum Action {
@@ -96,6 +98,7 @@ pub struct NblApp {
     instances_dir_input: String,
     /// instance waiting for a delete confirmation: (id, name, folder)
     confirm_delete: Option<(String, String, PathBuf)>,
+    install_notice: Option<String>,
 }
 
 impl NblApp {
@@ -172,6 +175,7 @@ impl NblApp {
             cfg_changed: false,
             instances_dir_input,
             confirm_delete: None,
+            install_notice: None,
         };
         app.log(format!("数据目录: {}", layout.root().display()));
         if let Some(e) = load_error {
@@ -531,7 +535,10 @@ impl NblApp {
                                     .into_iter()
                                     .map(|f| format!("[光影] {f}")),
                             );
-                            let _ = datatx.send(DataMsg::Content(out));
+                            let _ = datatx.send(DataMsg::InstallFinished {
+                                message: format!("安装完成：已下载 {} 个文件", files.len()),
+                                items: out,
+                            });
                             ctx.tx.done(format!("已下载 {} 个文件", files.len()));
                         }
                         Err(e) => ctx.tx.failed(format!("安装失败: {e}")),
@@ -726,6 +733,13 @@ impl NblApp {
                     self.log(message);
                     self.show_login = true;
                     self.busy = false;
+                }
+                DataMsg::InstallFinished { message, items } => {
+                    self.content = items;
+                    self.install_notice = Some(message.clone());
+                    self.log(message);
+                    self.busy = false;
+                    self.progress = None;
                 }
             }
         }
@@ -969,7 +983,11 @@ impl eframe::App for NblApp {
                                             hit.author,
                                             crate::util::human_bytes(hit.downloads)
                                         ));
-                                        if ui.button("安装").clicked() {
+                                        let install = ui.add_enabled(
+                                            !self.busy,
+                                            egui::Button::new("安装").min_size(egui::vec2(72.0, 28.0)),
+                                        );
+                                        if install.clicked() {
                                             pending = Some(Action::InstallMod(
                                                 hit.project_id.clone(),
                                             ));
@@ -1098,6 +1116,24 @@ impl eframe::App for NblApp {
         }
         if self.confirm_delete.is_some() {
             self.delete_confirm_window(ctx, &mut pending);
+        }
+        if let Some(message) = self.install_notice.clone() {
+            let mut open = true;
+            let mut close = false;
+            egui::Window::new("安装完成")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(message);
+                    ui.add_space(6.0);
+                    if ui.button("确定").clicked() {
+                        close = true;
+                    }
+                });
+            if close || !open {
+                self.install_notice = None;
+            }
         }
         if let Some((code, uri, message)) = self.device.clone() {
             let mut open = true;
